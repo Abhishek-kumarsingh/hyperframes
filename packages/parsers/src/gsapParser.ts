@@ -49,8 +49,13 @@ export {
   classifyPropertyGroup,
   classifyTweenPropertyGroup,
 } from "./gsapConstants";
-import { classifyPropertyGroup, classifyTweenPropertyGroup } from "./gsapConstants";
+import {
+  classifyPropertyGroup,
+  classifyTweenPropertyGroup,
+  isXYPositionWrite,
+} from "./gsapConstants";
 import type { PropertyGroupName } from "./gsapConstants";
+import { clipTweenMatcher, hasExplicitTime } from "./clipTweens";
 import {
   findObjectArrayKeyframeIndex,
   getCompatibleObjectArrayKeyframeTiming,
@@ -216,6 +221,13 @@ function scopeChainOf(path: AstPath): AstNode[] {
 /** Per-scope element bindings: scopeNode → (variable name → selector). */
 type TargetBindings = Map<any, Map<string, string>>;
 
+interface TargetHelper {
+  params: string[];
+  returnNode: AstNode;
+}
+
+type TargetHelpers = Map<any, Map<string, TargetHelper>>;
+
 function addBinding(
   bindings: TargetBindings,
   scopeNode: AstNode,
@@ -230,26 +242,110 @@ function addBinding(
   if (!scoped.has(name)) scoped.set(name, selector);
 }
 
+function directHelperReturn(node: AstNode): AstNode | null {
+  if (node.type === "ArrowFunctionExpression" && node.body?.type !== "BlockStatement") {
+    return node.body;
+  }
+  if (!isFunctionNode(node) || node.body?.type !== "BlockStatement") return null;
+  const returns = (node.body.body ?? []).filter(
+    (statement: AstNode) => statement.type === "ReturnStatement" && statement.argument,
+  );
+  return returns.length === 1 ? returns[0].argument : null;
+}
+
+function collectTargetHelpers(ast: AstNode): TargetHelpers {
+  const helpers: TargetHelpers = new Map();
+  const add = (scopeNode: AstNode, name: string, fn: AstNode): void => {
+    const returnNode = directHelperReturn(fn);
+    const params = (fn.params ?? [])
+      .filter((param: AstNode) => param.type === "Identifier")
+      .map((param: AstNode) => param.name);
+    if (!returnNode || params.length !== (fn.params?.length ?? 0)) return;
+    let scoped = helpers.get(scopeNode);
+    if (!scoped) {
+      scoped = new Map();
+      helpers.set(scopeNode, scoped);
+    }
+    if (!scoped.has(name)) scoped.set(name, { params, returnNode });
+  };
+
+  recast.types.visit(ast, {
+    visitFunctionDeclaration(path: AstPath) {
+      const name = path.node.id?.name;
+      const scopeNode = enclosingScopeNode(path);
+      if (name && scopeNode) add(scopeNode, name, path.node);
+      this.traverse(path);
+    },
+    visitVariableDeclarator(path: AstPath) {
+      const name = path.node.id?.name;
+      const fn = path.node.init;
+      const scopeNode = enclosingScopeNode(path);
+      if (name && fn && isFunctionNode(fn) && scopeNode) add(scopeNode, name, fn);
+      this.traverse(path);
+    },
+  });
+  return helpers;
+}
+
+function lookupTargetHelper(
+  name: string,
+  path: AstPath,
+  helpers: TargetHelpers,
+): TargetHelper | null {
+  for (const scopeNode of scopeChainOf(path)) {
+    const helper = helpers.get(scopeNode)?.get(name);
+    if (helper) return helper;
+  }
+  return null;
+}
+
+function selectorFromTargetCall(
+  node: AstNode,
+  path: AstPath,
+  scope: ScopeBindings,
+  helpers: TargetHelpers,
+): string | null {
+  const direct = selectorFromQueryCall(node, scope);
+  if (direct) return direct;
+  if (node?.type !== "CallExpression" || node.callee?.type !== "Identifier") return null;
+  const helper = lookupTargetHelper(node.callee.name, path, helpers);
+  if (!helper || helper.params.length !== (node.arguments?.length ?? 0)) return null;
+
+  const helperScope = new Map(scope);
+  for (let i = 0; i < helper.params.length; i += 1) {
+    const param = helper.params[i];
+    if (!param) return null;
+    const value = resolveNode(node.arguments[i], scope);
+    if (value === undefined) return null;
+    helperScope.set(param, value);
+  }
+  return selectorFromQueryCall(helper.returnNode, helperScope);
+}
+
 /**
  * Build a lexically-scoped index of element variables → selector. Two passes:
  * (1) direct DOM-lookup assignments (`const x = root.querySelector(...)`), then
  * (2) iteration callback params (`coll.forEach(el => …)`), whose element type is
  * the collection's selector — resolved against the pass-1 bindings.
  */
-function collectTargetBindings(ast: AstNode, scope: ScopeBindings): TargetBindings {
+function collectTargetBindings(
+  ast: AstNode,
+  scope: ScopeBindings,
+  helpers: TargetHelpers,
+): TargetBindings {
   const bindings: TargetBindings = new Map();
 
   recast.types.visit(ast, {
     visitVariableDeclarator(path: AstPath) {
       const name = path.node.id?.name;
-      const selector = selectorFromQueryCall(path.node.init, scope);
+      const selector = selectorFromTargetCall(path.node.init, path, scope, helpers);
       const scopeNode = enclosingScopeNode(path);
       if (name && selector !== null && scopeNode) addBinding(bindings, scopeNode, name, selector);
       this.traverse(path);
     },
     visitAssignmentExpression(path: AstPath) {
       const left = path.node.left;
-      const selector = selectorFromQueryCall(path.node.right, scope);
+      const selector = selectorFromTargetCall(path.node.right, path, scope, helpers);
       const scopeNode = enclosingScopeNode(path);
       if (left?.type === "Identifier" && selector !== null && scopeNode) {
         addBinding(bindings, scopeNode, left.name, selector);
@@ -311,6 +407,23 @@ function lookupBinding(name: string, path: AstPath, bindings: TargetBindings): s
   return null;
 }
 
+function hasUnresolvedArrayPart(
+  node: AstNode,
+  path: AstPath,
+  scope: ScopeBindings,
+  bindings: TargetBindings,
+  helpers: TargetHelpers,
+): boolean {
+  return (
+    node?.type === "ArrayExpression" &&
+    node.elements.some(
+      (el: AstNode) =>
+        !resolveTargetSelector(el, path, scope, bindings, helpers) ||
+        hasUnresolvedArrayPart(el, path, scope, bindings, helpers),
+    )
+  );
+}
+
 /**
  * Resolve a tween's first argument to a CSS selector. Handles inline string
  * literals, element variables (lexically scoped), arrays of elements (joined
@@ -324,6 +437,7 @@ function resolveTargetSelector(
   path: AstPath,
   scope: ScopeBindings,
   bindings: TargetBindings,
+  helpers: TargetHelpers,
 ): string | null {
   if (!node) return null;
   if (node.type === "StringLiteral" || node.type === "Literal") {
@@ -333,11 +447,11 @@ function resolveTargetSelector(
     return lookupBinding(node.name, path, bindings);
   }
   if (node.type === "CallExpression") {
-    return selectorFromQueryCall(node, scope);
+    return selectorFromTargetCall(node, path, scope, helpers);
   }
   if (node.type === "ArrayExpression") {
     const parts = node.elements
-      .map((el: AstNode) => resolveTargetSelector(el, path, scope, bindings))
+      .map((el: AstNode) => resolveTargetSelector(el, path, scope, bindings, helpers))
       .filter((s: string | null): s is string => typeof s === "string" && s.length > 0);
     return parts.length > 0 ? parts.join(", ") : null;
   }
@@ -493,6 +607,7 @@ interface TweenCallInfo {
   node: AstNode;
   method: GsapMethod;
   selector: string;
+  selectorPartial?: boolean;
   varsArg: AstNode;
   fromArg?: AstNode;
   positionArg?: AstNode;
@@ -518,6 +633,7 @@ function findAllTweenCalls(
   ref: TimelineRef,
   scope: ScopeBindings,
   targetBindings: TargetBindings,
+  targetHelpers: TargetHelpers,
 ): TweenCallInfo[] {
   const results: TweenCallInfo[] = [];
   recast.types.visit(ast, {
@@ -554,7 +670,11 @@ function findAllTweenCalls(
           return;
         }
         const selectorValue =
-          resolveTargetSelector(args[0], path, scope, targetBindings) ?? "__unresolved__";
+          resolveTargetSelector(args[0], path, scope, targetBindings, targetHelpers) ??
+          "__unresolved__";
+        const partial = hasUnresolvedArrayPart(args[0], path, scope, targetBindings, targetHelpers)
+          ? { selectorPartial: true }
+          : {};
 
         if (method === "fromTo") {
           results.push({
@@ -562,6 +682,7 @@ function findAllTweenCalls(
             node,
             method: "fromTo",
             selector: selectorValue,
+            ...partial,
             fromArg: args[1],
             varsArg: args[2],
             positionArg: args[3],
@@ -572,6 +693,7 @@ function findAllTweenCalls(
             node,
             method: method as GsapMethod,
             selector: selectorValue,
+            ...partial,
             varsArg: args[1],
             positionArg: args[2],
             ...(isGlobalSet ? { global: true } : {}),
@@ -1040,6 +1162,7 @@ function tweenCallToAnimation(
   if (motionPathResult) anim.arcPath = motionPathResult.arcPath;
   if (hasUnresolvedKeyframes) anim.hasUnresolvedKeyframes = true;
   if (call.selector === "__unresolved__") anim.hasUnresolvedSelector = true;
+  if (call.selectorPartial) anim.hasPartialSelector = true;
   return anim;
 }
 
@@ -1178,11 +1301,12 @@ interface ParsedGsapAst {
 function parseGsapAst(script: string): ParsedGsapAst {
   const ast = parseScript(script);
   const scope = collectScopeBindings(ast);
-  const targetBindings = collectTargetBindings(ast, scope);
+  const targetHelpers = collectTargetHelpers(ast);
+  const targetBindings = collectTargetBindings(ast, scope, targetHelpers);
   const detection = findTimelineVar(ast, scope);
   const ref: TimelineRef = detection.ref ?? { kind: "identifier", name: "tl" };
   const timelineVar = timelineRootSource(ref);
-  const calls = findAllTweenCalls(ast, ref, scope, targetBindings);
+  const calls = findAllTweenCalls(ast, ref, scope, targetBindings, targetHelpers);
   sortBySourcePosition(calls);
   const rawAnims = calls.map((call) => tweenCallToAnimation(call, scope));
   applyTimelineDefaults(rawAnims, detection.defaults);
@@ -1368,9 +1492,10 @@ function findStatementPath(path: AstPath): AstPath | null {
 
 function insertAfterAnchor(parsed: ParsedGsapAst, newStatement: AstNode): void {
   const lastCall = parsed.located[parsed.located.length - 1]?.call;
-  const anchorPath = lastCall
-    ? findStatementPath(lastCall.path)
-    : findTimelineDeclarationPath(parsed.ast, parsed.timelineVar);
+  const lastPath = lastCall ? findStatementPath(lastCall.path) : null;
+  const timeline = findTimelineDeclarationPath(parsed.ast, parsed.timelineVar);
+  const beforeTimeline = !!timeline && !!lastPath && lastPath.node.start < timeline.node.start;
+  const anchorPath = !lastCall || beforeTimeline ? timeline : lastPath;
   if (anchorPath) {
     anchorPath.insertAfter(newStatement);
   } else {
@@ -1447,7 +1572,9 @@ export function shiftPositionsInScript(
   script: string,
   targetSelector: string,
   delta: number,
+  root?: ParentNode,
 ): string {
+  const carries = clipTweenMatcher(targetSelector, root);
   let parsed: ParsedGsapAst;
   try {
     parsed = parseGsapAst(script);
@@ -1457,8 +1584,7 @@ export function shiftPositionsInScript(
   }
   let changed = false;
   for (const entry of parsed.located) {
-    if (entry.animation.targetSelector !== targetSelector) continue;
-    if (typeof entry.animation.position !== "number") continue;
+    if (!carries(entry.animation) || !hasExplicitTime(entry.animation)) continue;
     const newPos = Math.max(0, Math.round((entry.animation.position + delta) * 1000) / 1000);
     applyUpdatesToCall(entry.call, { position: newPos });
     changed = true;
@@ -1473,9 +1599,11 @@ export function scalePositionsInScript(
   oldDuration: number,
   newStart: number,
   newDuration: number,
+  root?: ParentNode,
 ): string {
   if (oldDuration <= 0 || newDuration <= 0) return script;
   const ratio = newDuration / oldDuration;
+  const carries = clipTweenMatcher(targetSelector, root);
   let parsed: ParsedGsapAst;
   try {
     parsed = parseGsapAst(script);
@@ -1485,13 +1613,14 @@ export function scalePositionsInScript(
   }
   let changed = false;
   for (const entry of parsed.located) {
-    if (entry.animation.targetSelector !== targetSelector) continue;
-    if (typeof entry.animation.position !== "number") continue;
-    const newPos = Math.max(
-      0,
-      Math.round((newStart + (entry.animation.position - oldStart) * ratio) * 1000) / 1000,
-    );
-    const updates: Partial<GsapAnimation> = { position: newPos };
+    if (!carries(entry.animation) || typeof entry.animation.position !== "number") continue;
+    const updates: Partial<GsapAnimation> = {};
+    if (hasExplicitTime(entry.animation)) {
+      updates.position = Math.max(
+        0,
+        Math.round((newStart + (entry.animation.position - oldStart) * ratio) * 1000) / 1000,
+      );
+    }
     if (typeof entry.animation.duration === "number" && entry.animation.duration > 0) {
       updates.duration = Math.max(
         0.001,
@@ -1665,8 +1794,8 @@ function removeCallFromAst(call: TweenCallInfo): void {
 /**
  * Recast twin of {@link dedupePositionWritesInScript} (acorn). Enforce "exactly
  * one position write per element": keep `keepId` (or the LAST position write in
- * source order if stale), remove every OTHER pure-position write
- * (`propertyGroup === "position"` — tl.to/from/fromTo flat-or-keyframed, tl.set,
+ * source order if stale), remove every OTHER x/y position write
+ * (`isXYPositionWrite` — tl.to/from/fromTo flat-or-keyframed, tl.set,
  * standalone gsap.set, incl. degenerate duration:0 tweens). Non-position writes
  * for the selector are left untouched.
  */
@@ -1682,7 +1811,7 @@ export function dedupePositionWritesInScript(
     return script;
   }
   const posWrites = parsed.located.filter(
-    (l) => l.animation.targetSelector === selector && l.animation.propertyGroup === "position",
+    (l) => l.animation.targetSelector === selector && isXYPositionWrite(l.animation),
   );
   if (posWrites.length <= 1) return script;
   const keeper = posWrites.find((l) => l.id === keepId) ?? posWrites[posWrites.length - 1]!;
